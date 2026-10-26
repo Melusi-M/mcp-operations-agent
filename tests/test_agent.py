@@ -1,9 +1,14 @@
 import json
 from pathlib import Path
 from typing import Any
+import asyncio
 
 import pytest
 from mcp import Client
+from mcp.types import (
+    CallToolResult,
+    TextContent,
+)
 
 from mcp_operations_agent.agent import (
     AgentExecutionError,
@@ -60,6 +65,53 @@ class ScriptedClaudeGateway:
         return self.turns.pop(0)
 
 
+class ToolClientProxy:
+    def __init__(
+        self,
+        client,
+        *,
+        delay_seconds: float = 0,
+        raised_error: Exception | None = None,
+        replacement_result: (
+            CallToolResult | None
+        ) = None,
+    ) -> None:
+        self.client = client
+        self.delay_seconds = delay_seconds
+        self.raised_error = raised_error
+        self.replacement_result = (
+            replacement_result
+        )
+
+    async def list_tools(
+        self,
+        *,
+        cursor: str | None = None,
+    ):
+        return await self.client.list_tools(
+            cursor=cursor
+        )
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments=None,
+    ) -> CallToolResult:
+        if self.delay_seconds:
+            await asyncio.sleep(
+                self.delay_seconds
+            )
+
+        if self.raised_error is not None:
+            raise self.raised_error
+
+        if self.replacement_result is not None:
+            return self.replacement_result
+
+        return await self.client.call_tool(
+            name,
+            arguments or {},
+        )
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
@@ -377,3 +429,200 @@ async def test_agent_audits_successful_tool_call(
     }
     assert events[0]["success"] is True
     assert events[0]["error"] is None
+@pytest.mark.anyio
+async def test_agent_converts_tool_timeout_to_error(
+    server,
+) -> None:
+    claude = ScriptedClaudeGateway(
+        [
+            ClaudeTurn(
+                stop_reason="tool_use",
+                content=[
+                    ClaudeToolUseBlock(
+                        id="tool-timeout",
+                        name="find_orders",
+                        input={
+                            "status": "pending",
+                        },
+                    ),
+                ],
+            ),
+            ClaudeTurn(
+                stop_reason="end_turn",
+                content=[
+                    ClaudeTextBlock(
+                        text=(
+                            "Order data could not "
+                            "be verified."
+                        )
+                    ),
+                ],
+            ),
+        ]
+    )
+
+    async with Client(
+        server,
+        raise_exceptions=True,
+    ) as client:
+        proxy = ToolClientProxy(
+            client,
+            delay_seconds=0.05,
+        )
+        agent = MCPClaudeAgent(
+            claude=claude,
+            mcp_client=proxy,
+            tool_timeout_seconds=0.001,
+        )
+
+        answer = await agent.run(
+            "Show pending orders."
+        )
+
+    assert answer == (
+        "Order data could not be verified."
+    )
+
+    tool_result = (
+        claude.received_messages[1]
+        [-1]["content"][0]
+    )
+
+    assert tool_result["is_error"] is True
+    assert "timed out" in (
+        tool_result["content"]
+    )
+
+
+@pytest.mark.anyio
+async def test_agent_converts_tool_exception_to_error(
+    server,
+) -> None:
+    claude = ScriptedClaudeGateway(
+        [
+            ClaudeTurn(
+                stop_reason="tool_use",
+                content=[
+                    ClaudeToolUseBlock(
+                        id="tool-failure",
+                        name="find_orders",
+                        input={},
+                    ),
+                ],
+            ),
+            ClaudeTurn(
+                stop_reason="end_turn",
+                content=[
+                    ClaudeTextBlock(
+                        text=(
+                            "The operations service "
+                            "is unavailable."
+                        )
+                    ),
+                ],
+            ),
+        ]
+    )
+
+    async with Client(
+        server,
+        raise_exceptions=True,
+    ) as client:
+        proxy = ToolClientProxy(
+            client,
+            raised_error=RuntimeError(
+                "Internal database password leaked"
+            ),
+        )
+        agent = MCPClaudeAgent(
+            claude=claude,
+            mcp_client=proxy,
+        )
+
+        answer = await agent.run(
+            "Show orders."
+        )
+
+    assert answer == (
+        "The operations service is unavailable."
+    )
+
+    tool_result = (
+        claude.received_messages[1]
+        [-1]["content"][0]
+    )
+
+    assert tool_result["is_error"] is True
+    assert "internal service error" in (
+        tool_result["content"]
+    )
+    assert "password" not in (
+        tool_result["content"]
+    )
+
+
+@pytest.mark.anyio
+async def test_agent_bounds_large_tool_result(
+    server,
+) -> None:
+    claude = ScriptedClaudeGateway(
+        [
+            ClaudeTurn(
+                stop_reason="tool_use",
+                content=[
+                    ClaudeToolUseBlock(
+                        id="tool-large",
+                        name="find_orders",
+                        input={},
+                    ),
+                ],
+            ),
+            ClaudeTurn(
+                stop_reason="end_turn",
+                content=[
+                    ClaudeTextBlock(
+                        text=(
+                            "The result was safely bounded."
+                        )
+                    ),
+                ],
+            ),
+        ]
+    )
+
+    large_result = CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text="A" * 1_000,
+            )
+        ],
+        is_error=False,
+    )
+
+    async with Client(
+        server,
+        raise_exceptions=True,
+    ) as client:
+        proxy = ToolClientProxy(
+            client,
+            replacement_result=large_result,
+        )
+        agent = MCPClaudeAgent(
+            claude=claude,
+            mcp_client=proxy,
+            maximum_tool_result_chars=200,
+        )
+
+        await agent.run(
+            "Return a large result."
+        )
+
+    tool_result = (
+        claude.received_messages[1]
+        [-1]["content"][0]
+    )
+    content = tool_result["content"]
+
+    assert len(content) == 200
+    assert "TRUNCATED" in content

@@ -136,6 +136,12 @@ async def run_agent(
             maximum_rounds=(
                 settings.maximum_rounds
             ),
+            tool_timeout_seconds=(
+                settings.tool_timeout_seconds
+            ),
+            maximum_tool_result_chars=(
+                settings.maximum_tool_result_chars
+            ),
             audit_logger=audit_logger,
         )
 

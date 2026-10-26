@@ -96,6 +96,22 @@ class Settings(BaseSettings):
             "MCP_OPERATIONS_SHIPPING_TIMEOUT_SECONDS"
         ),
     )
+    tool_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        le=120,
+        validation_alias=(
+            "MCP_OPERATIONS_TOOL_TIMEOUT_SECONDS"
+        ),
+    )
+    maximum_tool_result_chars: int = Field(
+        default=20_000,
+        ge=100,
+        le=200_000,
+        validation_alias=(
+            "MCP_OPERATIONS_MAXIMUM_TOOL_RESULT_CHARS"
+        ),
+    )
     shipping_maximum_attempts: int = Field(
         default=2,
         ge=1,

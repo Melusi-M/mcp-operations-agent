@@ -1,3 +1,4 @@
+import asyncio
 import json
 from time import perf_counter
 from typing import Any
@@ -28,15 +29,18 @@ SYSTEM_PROMPT = """
 You are a read-only business operations assistant.
 
 Use the available tools when the answer depends on
-customer or order data.
+customer, order, policy, or shipping data.
 
 Rules:
-- Never invent customer or order information.
-- Treat tool results as authoritative for this session.
+- Never invent business information.
+- Treat successful tool results as authoritative for
+  this session.
 - Do not claim that a tool succeeded when it returned
   an error.
 - If a tool fails because of invalid arguments, correct
   the arguments and try again when possible.
+- If a tool remains unavailable, clearly explain what
+  could not be verified and provide only supported facts.
 - Do not request data unrelated to the user's question.
 - Give a concise final answer.
 """.strip()
@@ -55,6 +59,8 @@ class MCPClaudeAgent:
         claude: ClaudeGateway,
         mcp_client: MCPClientLike,
         maximum_rounds: int = 5,
+        tool_timeout_seconds: float = 10.0,
+        maximum_tool_result_chars: int = 20_000,
         audit_logger: AuditLogger | None = None,
     ) -> None:
         if maximum_rounds <= 0:
@@ -62,9 +68,27 @@ class MCPClaudeAgent:
                 "maximum_rounds must be greater than zero"
             )
 
+        if tool_timeout_seconds <= 0:
+            raise ValueError(
+                "tool_timeout_seconds must be "
+                "greater than zero"
+            )
+
+        if maximum_tool_result_chars < 100:
+            raise ValueError(
+                "maximum_tool_result_chars must be "
+                "at least 100"
+            )
+
         self.claude = claude
         self.mcp_client = mcp_client
         self.maximum_rounds = maximum_rounds
+        self.tool_timeout_seconds = (
+            tool_timeout_seconds
+        )
+        self.maximum_tool_result_chars = (
+            maximum_tool_result_chars
+        )
         self.audit_logger = (
             audit_logger
             or NullAuditLogger()
@@ -203,26 +227,59 @@ class MCPClaudeAgent:
                 error=error,
             )
 
-            return {
-                "type": "tool_result",
-                "tool_use_id": request.id,
-                "content": error,
-                "is_error": True,
-            }
+            return self._create_error_result(
+                request=request,
+                message=error,
+            )
 
         try:
-            result = await self.mcp_client.call_tool(
-                request.name,
-                request.input,
+            async with asyncio.timeout(
+                self.tool_timeout_seconds
+            ):
+                result = (
+                    await self.mcp_client.call_tool(
+                        request.name,
+                        request.input,
+                    )
+                )
+        except TimeoutError:
+            error = (
+                "The tool call timed out before "
+                "returning a result."
             )
-        except Exception as error:
+
             self._record_tool_call(
                 request=request,
                 success=False,
                 started_at=started_at,
-                error=str(error),
+                error=error,
             )
-            raise
+
+            return self._create_error_result(
+                request=request,
+                message=error,
+            )
+        except Exception as exception:
+            audit_error = (
+                f"{type(exception).__name__}: "
+                "MCP tool execution failed"
+            )
+            model_error = (
+                "The tool could not be executed "
+                "because of an internal service error."
+            )
+
+            self._record_tool_call(
+                request=request,
+                success=False,
+                started_at=started_at,
+                error=audit_error,
+            )
+
+            return self._create_error_result(
+                request=request,
+                message=model_error,
+            )
 
         error_message = None
 
@@ -231,6 +288,13 @@ class MCPClaudeAgent:
                 extract_text_content(result)
                 or "The MCP tool returned an error."
             )
+
+        serialized_result = (
+            self._serialize_tool_result(result)
+        )
+        bounded_result = self._bound_tool_content(
+            serialized_result
+        )
 
         self._record_tool_call(
             request=request,
@@ -242,10 +306,50 @@ class MCPClaudeAgent:
         return {
             "type": "tool_result",
             "tool_use_id": request.id,
-            "content": self._serialize_tool_result(
-                result
-            ),
+            "content": bounded_result,
             "is_error": result.is_error,
+        }
+
+    def _bound_tool_content(
+        self,
+        content: str,
+    ) -> str:
+        if len(content) <= (
+            self.maximum_tool_result_chars
+        ):
+            return content
+
+        marker = (
+            "\n...[TRUNCATED: tool result exceeded "
+            "the configured size limit]"
+        )
+
+        available_characters = (
+            self.maximum_tool_result_chars
+            - len(marker)
+        )
+
+        if available_characters <= 0:
+            return marker[
+                :self.maximum_tool_result_chars
+            ]
+
+        return (
+            content[:available_characters]
+            + marker
+        )
+
+    @staticmethod
+    def _create_error_result(
+        *,
+        request: ClaudeToolUseBlock,
+        message: str,
+    ) -> dict[str, Any]:
+        return {
+            "type": "tool_result",
+            "tool_use_id": request.id,
+            "content": message,
+            "is_error": True,
         }
 
     def _record_tool_call(

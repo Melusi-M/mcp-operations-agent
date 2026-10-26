@@ -85,6 +85,18 @@ def test_settings_require_api_key(
             "MCP_OPERATIONS_MAXIMUM_ROUNDS",
             "11",
         ),
+        (
+            "MCP_OPERATIONS_MAXIMUM_FILE_BYTES",
+            "0",
+        ),
+        (
+            "MCP_OPERATIONS_TOOL_TIMEOUT_SECONDS",
+            "0",
+        ),
+        (
+            "MCP_OPERATIONS_MAXIMUM_TOOL_RESULT_CHARS",
+            "99",
+        ),
     ],
 )
 def test_settings_reject_invalid_limits(
@@ -100,6 +112,14 @@ def test_settings_reject_invalid_limits(
         variable,
         value,
     )
+    (
+            "MCP_OPERATIONS_TOOL_TIMEOUT_SECONDS",
+            "0",
+        ),
+    (
+            "MCP_OPERATIONS_MAXIMUM_TOOL_RESULT_CHARS",
+            "99",
+        ),
 
     with pytest.raises(ValidationError):
         Settings(
