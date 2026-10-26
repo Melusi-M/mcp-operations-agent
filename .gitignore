@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+.env.*
+!.env.example
+
+data/
+__pycache__/
+.pytest_cache/
+.venv/
+.coverage
+htmlcov/
+
+# Local application data and audit records
+data/
+run_logs/
